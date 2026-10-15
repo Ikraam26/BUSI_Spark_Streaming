@@ -1,0 +1,11 @@
+# Service ML
+pandas
+numpy
+scikit-learn
+skl2onnx
+onnx
+onnxruntime
+
+# Dashboard
+streamlit
+altair
