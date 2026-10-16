@@ -9,12 +9,14 @@ Fonctionnement : le script tourne en boucle. Toutes les --interval secondes il r
 images.csv ; des qu'il y a assez d'images (au moins --min-per-class par classe), il
 entraine un premier modele, puis il re-entraine a chaque fois que --retrain-every
 nouvelles images sont arrivees. Le modele s'ameliore donc au fil du flux.
+Le service s'arrete tout seul quand aucune nouvelle image n'arrive pendant --idle-timeout secondes.
 
 Lancer depuis la racine du projet :
     python ml_service/train_model.py           # surveille images.csv et re-entraine
     python ml_service/train_model.py --once    # un seul entrainement
 """
 import argparse
+import itertools
 import json
 import os
 import time
@@ -185,22 +187,40 @@ def main() -> None:
     parser.add_argument("--retrain-every", type=int, default=6, help="nouvelles images avant re-entrainement")
     parser.add_argument("--min-per-class", type=int, default=2, help="images minimum par classe")
     parser.add_argument("--balance", action="store_true", help="meme nombre d'images par classe (celui de la plus petite)")
+    parser.add_argument("--idle-timeout", type=int, default=600,
+                        help="arret apres ce nombre de secondes sans nouvelle image")
     args = parser.parse_args()
 
     # nombre d'images utilisees au dernier entrainement (0 = jamais entraine)
     trained_on = 0
+    # nombre d'images vues a la derniere verification, et heure de la derniere nouvelle image
+    seen = 0
+    last_new_image = time.time()
     print(f"[ML] lecture de {IMAGES_CSV.relative_to(ROOT)}, export vers {MODEL_FILE.relative_to(ROOT)}")
-    while True:
+    # une verification par tour ; count() numerote les tours 0, 1, 2... et c'est le "break"
+    # plus bas qui arrete la boucle
+    for _ in itertools.count():
         df = load_dataset()
+        if len(df) != seen:
+            seen = len(df)
+            last_new_image = time.time()
+        # on s'arrete apres un seul tour (--once) ou si plus aucune image n'arrive depuis --idle-timeout s
+        running = not args.once and time.time() - last_new_image < args.idle_timeout
+
         if not can_train(df, args.min_per_class):
             print(f"[ML] {len(df)} image(s), il en faut {args.min_per_class} par classe")
-        # premier entrainement, ou assez de nouvelles images depuis le dernier
-        elif trained_on == 0 or len(df) - trained_on >= args.retrain_every:
+        # premier entrainement, assez de nouvelles images depuis le dernier,
+        # ou dernier tour avec des images pas encore utilisees
+        elif (trained_on == 0 or len(df) - trained_on >= args.retrain_every
+              or (not running and len(df) > trained_on)):
             train(balance(df) if args.balance else df)
             trained_on = len(df)
-        if args.once:
+
+        if not running:
             break
         time.sleep(args.interval)
+    if not args.once:
+        print(f"[ML] aucune nouvelle image depuis {args.idle_timeout} s, arret du service")
 
 
 if __name__ == "__main__":

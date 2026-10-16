@@ -80,9 +80,8 @@ object ImageConsumer {
     val hist256 = new Array[Long](256)         // combien de pixels pour chaque niveau 0..255
     var sum = 0.0
     var sumSq = 0.0
-    var i = 0
-    // boucle while (plus rapide qu'un foreach sur ~300 000 pixels)
-    while (i < pixels.length) {
+    // un tour par pixel (i = position du pixel dans le tableau)
+    for (i <- pixels.indices) {
       val p = pixels(i)
       // extraction de R (bits 16-23), G (bits 8-15), B (bits 0-7),
       // puis conversion en gris avec les poids standards de la perception humaine
@@ -91,7 +90,6 @@ object ImageConsumer {
       hist256(g) += 1
       sum += g
       sumSq += g.toDouble * g
-      i += 1
     }
     val mean = sum / n
     // ecart-type = racine(moyenne des carres - carre de la moyenne)
