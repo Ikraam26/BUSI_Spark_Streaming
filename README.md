@@ -7,6 +7,8 @@ Les images arrivent au fil de l'eau ; Spark Structured Streaming en extrait des 
 un service Python entraîne un modèle et l'exporte en ONNX, et le consumer Spark l'utilise
 pour prédire chaque nouvelle image. Un dashboard Streamlit affiche le tout en direct.
 
+📄 **Explication détaillée et simple de tout le projet : [BUSI_SparkStream.pdf](BUSI_SparkStream.pdf)**
+
 ## Architecture
 
 ```mermaid
