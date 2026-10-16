@@ -40,7 +40,17 @@ case class ImageFeatures(
   stdIntensity: Double,     // contraste : ecart-type des niveaux de gris
   entropy: Double,          // desordre de l'histogramme des niveaux de gris
   gradient: Double,         // difference moyenne entre pixels voisins (texture)
-  histogram: Array[Double]  // HistBins classes de niveaux de gris, normalisees
+  histogram: Array[Double], // HistBins classes de niveaux de gris, normalisees
+  // texture : matrice de co-occurrence (GLCM) des niveaux de gris de deux pixels voisins
+  glcmContrast: Double,     // grand si les voisins ont des niveaux tres differents
+  glcmHomogeneity: Double,  // grand si les voisins ont des niveaux proches (zones lisses)
+  glcmEnergy: Double,       // grand si peu de couples de niveaux differents (texture reguliere)
+  glcmCorrelation: Double,  // lien lineaire entre le niveau d'un pixel et celui de son voisin
+  lbp: Array[Double],       // LbpBins motifs locaux (LBP) : bords, coins, zones plates...
+  // zone centrale de l'image (moitie de la largeur et de la hauteur), ou se trouve souvent la lesion
+  centerMean: Double,       // luminosite moyenne du centre
+  centerStd: Double,        // contraste du centre
+  centerRatio: Double       // luminosite du centre / luminosite de toute l'image
 )
 
 object ImageConsumer {
@@ -49,10 +59,19 @@ object ImageConsumer {
   val HistBins = 16
   // noms des colonnes de l'histogramme : h00, h01, ..., h15
   val histColumns: Seq[String] = (0 until HistBins).map(i => f"h$i%02d")
+  // la GLCM compare les niveaux de gris regroupes en 16 classes (256 niveaux seraient trop fins)
+  val GlcmLevels = 16
+  // LBP "uniforme invariant en rotation" a 8 voisins : 0 a 8 voisins plus clairs que le centre
+  // (motifs simples), plus une classe 9 pour tous les motifs irreguliers
+  val LbpBins = 10
+  val lbpColumns: Seq[String] = (0 until LbpBins).map(i => s"lbp$i")
+  val textureColumns: Seq[String] =
+    Seq("glcmContrast", "glcmHomogeneity", "glcmEnergy", "glcmCorrelation") ++ lbpColumns ++
+      Seq("centerMean", "centerStd", "centerRatio")
 
   // colonnes utilisables par le modele (le service ML choisit parmi celles-ci)
   val featureColumns: Seq[String] =
-    Seq("width", "height", "meanIntensity", "stdIntensity", "entropy", "gradient") ++ histColumns
+    Seq("width", "height", "meanIntensity", "stdIntensity", "entropy", "gradient") ++ histColumns ++ textureColumns
 
   // schema fixe du format binaryFile (obligatoire pour une source fichier en streaming)
   // Pour chaque fichier, Spark fournit : son chemin, sa date de modification,
@@ -104,14 +123,61 @@ object ImageConsumer {
 
     // voisins de droite et du dessous
     // gradient moyen : grand si l'image a beaucoup de contours / de grain, petit si elle est lisse
+    // glcm(a)(b) : nombre de couples de voisins dont l'un est au niveau a et l'autre au niveau b
+    // (comptes dans les deux sens : la matrice est symetrique)
+    val glcm = Array.ofDim[Double](GlcmLevels, GlcmLevels)
     var gradSum = 0.0
     var gradCount = 0L
     for (y <- 0 until h; x <- 0 until w) {
       val idx = y * w + x   // position du pixel (x, y) dans le tableau a une dimension
-      if (x + 1 < w) { gradSum += math.abs(gray(idx) - gray(idx + 1)); gradCount += 1 }
-      if (y + 1 < h) { gradSum += math.abs(gray(idx) - gray(idx + w)); gradCount += 1 }
+      val a = gray(idx) * GlcmLevels / 256
+      if (x + 1 < w) {
+        gradSum += math.abs(gray(idx) - gray(idx + 1)); gradCount += 1
+        val b = gray(idx + 1) * GlcmLevels / 256
+        glcm(a)(b) += 1; glcm(b)(a) += 1
+      }
+      if (y + 1 < h) {
+        gradSum += math.abs(gray(idx) - gray(idx + w)); gradCount += 1
+        val b = gray(idx + w) * GlcmLevels / 256
+        glcm(a)(b) += 1; glcm(b)(a) += 1
+      }
     }
     val gradient = if (gradCount > 0) gradSum / gradCount else 0.0
+
+    // GLCM en proportions (la somme vaut 1), puis ses 4 indicateurs classiques (Haralick)
+    val glcmTotal = math.max(glcm.map(_.sum).sum, 1.0)
+    val cells = for (i <- 0 until GlcmLevels; j <- 0 until GlcmLevels) yield (i, j, glcm(i)(j) / glcmTotal)
+    val glcmMean = cells.map { case (i, _, p) => i * p }.sum
+    val glcmVar = cells.map { case (i, _, p) => (i - glcmMean) * (i - glcmMean) * p }.sum
+    val glcmContrast = cells.map { case (i, j, p) => (i - j) * (i - j) * p }.sum
+    val glcmHomogeneity = cells.map { case (i, j, p) => p / (1 + math.abs(i - j)) }.sum
+    val glcmEnergy = cells.map { case (_, _, p) => p * p }.sum
+    val glcmCorrelation =
+      if (glcmVar > 0) cells.map { case (i, j, p) => (i - glcmMean) * (j - glcmMean) * p }.sum / glcmVar else 0.0
+
+    // LBP : pour chaque pixel (hors bords), on regarde ses 8 voisins dans l'ordre du tour
+    // et on note lesquels sont au moins aussi clairs que lui. Si ce tour change au plus 2 fois
+    // entre "plus clair" et "plus sombre", le motif est simple (bord, coin, point...) : on le
+    // classe selon le nombre de voisins clairs (0 a 8). Sinon c'est un motif irregulier (classe 9).
+    val neighbours = Seq((-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1))
+    val lbpHist = new Array[Double](LbpBins)
+    for (y <- 1 until h - 1; x <- 1 until w - 1) {
+      val c = gray(y * w + x)
+      val bits = neighbours.map { case (dy, dx) => if (gray((y + dy) * w + x + dx) >= c) 1 else 0 }
+      val transitions = bits.indices.count(k => bits(k) != bits((k + 7) % 8))
+      lbpHist(if (transitions <= 2) bits.sum else LbpBins - 1) += 1
+    }
+    val lbpTotal = math.max(lbpHist.sum, 1.0)
+    val lbp = lbpHist.map(_ / lbpTotal)
+
+    // zone centrale : on retire un quart de la largeur et de la hauteur de chaque cote
+    val centerPixels = for (y <- h / 4 until h - h / 4; x <- w / 4 until w - w / 4) yield gray(y * w + x).toDouble
+    val centerMean = if (centerPixels.nonEmpty) centerPixels.sum / centerPixels.length else mean
+    val centerStd =
+      if (centerPixels.nonEmpty)
+        math.sqrt(math.max(centerPixels.map(v => v * v).sum / centerPixels.length - centerMean * centerMean, 0.0))
+      else std
+    val centerRatio = if (mean > 0) centerMean / mean else 0.0
 
     // histogramme reduit a 16 classes, en proportion de pixels (la somme vaut 1) :
     // ainsi deux images de tailles differentes restent comparables
@@ -120,7 +186,8 @@ object ImageConsumer {
       hist256.slice(b * binWidth, (b + 1) * binWidth).sum / n
     }.toArray
 
-    Some(ImageFeatures(w, h, mean, std, entropy, gradient, histogram))
+    Some(ImageFeatures(w, h, mean, std, entropy, gradient, histogram,
+      glcmContrast, glcmHomogeneity, glcmEnergy, glcmCorrelation, lbp, centerMean, centerStd, centerRatio))
   }
 
   def main(args: Array[String]): Unit = {
@@ -196,7 +263,15 @@ object ImageConsumer {
         ) ++ histColumns.zipWithIndex.map { case (name, i) =>
           // une colonne par case de l'histogramme : h00 = features.histogram[0], etc.
           round(col("features.histogram")(i), 5).as(name)
-        }: _*   // ": _*" passe la liste de colonnes comme arguments separes a select(...)
+        } ++ Seq("glcmContrast", "glcmHomogeneity", "glcmEnergy", "glcmCorrelation").map { name =>
+          round(col(s"features.$name"), 5).as(name)
+        } ++ lbpColumns.zipWithIndex.map { case (name, i) =>
+          round(col("features.lbp")(i), 5).as(name)
+        } ++ Seq(
+          round(col("features.centerMean"), 2).as("centerMean"),
+          round(col("features.centerStd"), 2).as("centerStd"),
+          round(col("features.centerRatio"), 4).as("centerRatio")
+        ): _*   // ": _*" passe la liste de colonnes comme arguments separes a select(...)
       )
 
     // ---------- D. Prediction ----------

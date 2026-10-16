@@ -42,10 +42,16 @@ MODEL_FILE = ROOT / "model" / "busi_model.onnx"                 # sortie : lu pa
 
 # l'ordre de cette liste definit le numero de chaque classe : benign=0, malignant=1, normal=2
 LABELS = ["benign", "malignant", "normal"]
-# memes noms de colonnes que ImageConsumer.featureColumns
-FEATURES = ["width", "height", "meanIntensity", "stdIntensity", "entropy", "gradient"] + [
-    f"h{i:02d}" for i in range(16)
-]
+# memes noms de colonnes que ImageConsumer.featureColumns, sauf width et height :
+# la taille d'une image ne dit rien de la lesion, et dans la base BUSI elle varie selon la classe,
+# le modele apprendrait donc un biais de la base plutot que l'aspect de l'echographie
+FEATURES = (
+    ["meanIntensity", "stdIntensity", "entropy", "gradient"]
+    + [f"h{i:02d}" for i in range(16)]
+    + ["glcmContrast", "glcmHomogeneity", "glcmEnergy", "glcmCorrelation"]
+    + [f"lbp{i}" for i in range(10)]
+    + ["centerMean", "centerStd", "centerRatio"]
+)
 # opset supporte par onnxruntime Java 1.19 (cf. build.sbt)
 # (l'opset est la "version" des operations ONNX ; une version trop recente ne serait pas lisible en Scala)
 TARGET_OPSET = {"": 17, "ai.onnx.ml": 3}
@@ -97,10 +103,11 @@ def train(df: pd.DataFrame) -> dict:
     y = df["label"].map(LABELS.index).to_numpy(dtype=np.int64)
 
     # foret aleatoire : 200 arbres de decision qui votent.
-    #  - max_depth=6 limite la taille des arbres (evite d'apprendre "par coeur" avec peu d'images)
+    #  - pas de limite de profondeur : sur la base complete (780 images), des arbres complets
+    #    donnent ~72 % contre ~66 % avec max_depth=6 ; le vote des 200 arbres limite le "par coeur"
     #  - class_weight="balanced" compense les classes moins representees
     #  - random_state=42 rend les resultats reproductibles
-    clf = RandomForestClassifier(n_estimators=200, max_depth=6, class_weight="balanced", random_state=42)
+    clf = RandomForestClassifier(n_estimators=200, class_weight="balanced", random_state=42, n_jobs=-1)
 
     # evaluation honnete : validation croisee (chaque image predite par un modele qui ne l'a pas vue)
     # Les images sont coupees en `folds` groupes ; on entraine sur tous les groupes sauf un,
@@ -117,7 +124,7 @@ def train(df: pd.DataFrame) -> dict:
     # la version est simplement la date et l'heure de l'entrainement
     version = datetime.now().strftime("%Y%m%d-%H%M%S")
     # conversion scikit-learn -> ONNX
-    #  - "input" : nom de l'entree, un tableau [n images, 22 caracteristiques] (None = n quelconque)
+    #  - "input" : nom de l'entree, un tableau [n images, 37 caracteristiques] (None = n quelconque)
     #  - zipmap False : les probabilites sortent en tableau simple, plus facile a lire en Scala
     onx = convert_sklearn(
         clf,
